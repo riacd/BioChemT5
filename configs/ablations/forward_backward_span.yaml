@@ -1,0 +1,73 @@
+seed: 13
+
+experiment:
+  name: forward_backward_span
+  type: seq2seq_ablation
+
+data:
+  center_corpus: data/BiochemT5/pretrain_corpus/cluster_centers.rsmiles_aug20.centered.jsonl
+  dataset_type: memory
+  max_records: 64
+  max_source_length: 256
+  max_target_length: 128
+  ec_views_per_record: 1
+  task_probs:
+    forward: 0.35
+    retro: 0.35
+    mlm: 0.30
+
+masking:
+  mask_fraction: 0.15
+  mean_span_len: 3.0
+  base_weight: 1.0
+  center_weight: 4.0
+  neighbor_weight: 2.0
+  mlm_use_mapped_rxn: true
+
+tokenizer:
+  path: data/BiochemT5/tokenizer/smiles_wordlevel_final_vocab.json
+  rebuild: false
+  max_records: 50000
+  vocab_size: 4096
+
+model:
+  d_model: 64
+  d_ff: 128
+  d_kv: 64
+  num_layers: 1
+  num_decoder_layers: 1
+  num_heads: 4
+  dropout_rate: 0.1
+  projection_dim: 64
+
+loss:
+  ec_contrastive: 0.0
+  temperature: 0.07
+
+train:
+  output_dir: outputs/BiochemT5/ablations/forward_backward_span
+  batch_size: 4
+  num_workers: 0
+  learning_rate: 0.0003
+  max_grad_norm: 1.0
+  max_steps: 2
+  log_every: 1
+  save_every: 0
+  gradient_accumulation_steps: 1
+  mixed_precision: "no"
+  gradient_checkpointing: false
+  use_cuda: true
+  sampler:
+    type: random
+
+validation:
+  enabled: false
+
+logging:
+  wandb:
+    enabled: true
+    mode: offline
+    project: BioChemT5
+    name: forward_backward_span
+    dir: .
+    tags: [ablation, forward-retro-span]

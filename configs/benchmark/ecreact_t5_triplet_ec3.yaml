@@ -1,0 +1,38 @@
+pretrained_checkpoint: outputs/BiochemT5/production/forward_backward_span_t5_base_100k
+output_dir: outputs/BiochemT5/benchmark/ecreact_t5/triplet_ec3/seed_13
+
+data:
+  train_csv: benchmark/ECreact_bench/data/train_augmented.csv
+  test_csv: benchmark/ECreact_bench/data/test_augmented.csv
+  split_manifest: outputs/BiochemT5/benchmark/ecreact_t5/data/split_manifest.json
+  max_length: 1200
+
+task:
+  type: triplet
+  level: ec3
+  margin: 1.0
+
+training:
+  seed: 13
+  per_device_triplets: 8
+  validation_batch_size: 16
+  encoder_lr: 2.0e-5
+  projection_lr: 1.0e-4
+  weight_decay: 0.01
+  max_epochs: 10
+  patience: 2
+  max_grad_norm: 1.0
+  bf16: true
+  gradient_checkpointing: true
+  num_workers: 0
+
+prediction:
+  batch_size: 16
+  query_chunk: 512
+  library_chunk: 8192
+  published_predictions: ref/CLAIRE/dev/results/test_ec3_prediction.csv
+  published_level: ec3
+  triplet_prediction_csvs:
+    ec1: outputs/BiochemT5/benchmark/ecreact_t5/triplet_ec1/seed_13/top4_predictions.csv
+    ec2: outputs/BiochemT5/benchmark/ecreact_t5/triplet_ec2/seed_13/top4_predictions.csv
+    ec3: outputs/BiochemT5/benchmark/ecreact_t5/triplet_ec3/seed_13/top4_predictions.csv

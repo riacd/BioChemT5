@@ -1,0 +1,79 @@
+seed: 13
+
+experiment:
+  name: ec_hierarchy_only_smoke
+  type: ec_hierarchy_only_ablation
+
+data:
+  center_corpus: data/BiochemT5/pretrain_corpus/cluster_centers.rsmiles_aug20.centered.jsonl
+  index_path: data/BiochemT5/pretrain_corpus/cluster_centers.rsmiles_aug20.centered.index.pkl
+  dataset_type: indexed
+  max_records: null
+  max_source_length: 256
+  max_target_length: 64
+  ec_views_per_record: 1
+  task_probs: {}
+
+masking:
+  mask_fraction: 0.15
+  mean_span_len: 3.0
+  base_weight: 1.0
+  center_weight: 1.0
+  neighbor_weight: 1.0
+  mlm_use_mapped_rxn: true
+
+tokenizer:
+  path: data/BiochemT5/tokenizer/smiles_wordlevel_final_vocab.json
+  rebuild: false
+  max_records: null
+  vocab_size: 4096
+
+model:
+  d_model: 64
+  d_ff: 128
+  d_kv: 16
+  num_layers: 2
+  num_decoder_layers: 2
+  num_heads: 4
+  dropout_rate: 0.1
+  projection_dim: 32
+
+loss:
+  ec_contrastive: 1.0
+  temperature: 0.07
+
+ec:
+  contrastive:
+    enabled: true
+    level_weights: {ec1: 0.1, ec2: 0.2, ec3: 0.3, ec4: 0.4}
+  text_prediction:
+    enabled: false
+
+train:
+  output_dir: .tmp/ec_hierarchy_only_smoke
+  seq2seq_enabled: false
+  num_workers: 0
+  pin_memory: true
+  learning_rate: 0.0001
+  max_grad_norm: 1.0
+  max_steps: 1
+  log_every: 1
+  save_every: 0
+  auto_resume: false
+  gradient_accumulation_steps: 1
+  mixed_precision: bf16
+  gradient_checkpointing: true
+  ddp_static_graph: false
+  ddp_find_unused_parameters: false
+  use_cuda: true
+  sampler:
+    type: ec_hierarchical
+    groups_per_batch: 1
+    seq2seq_only_samples_per_batch: 0
+
+validation:
+  enabled: false
+
+logging:
+  wandb:
+    enabled: false

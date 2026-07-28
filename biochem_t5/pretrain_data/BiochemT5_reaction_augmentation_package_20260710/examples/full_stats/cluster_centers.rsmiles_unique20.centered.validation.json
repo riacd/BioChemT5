@@ -1,0 +1,38 @@
+{
+  "elapsed_s": 741.909,
+  "errors": {},
+  "first_errors": [],
+  "input_jsonl": "data/BiochemT5/pretrain_corpus/cluster_centers.rsmiles_unique20.centered.jsonl",
+  "reaction_center_source_counts": {
+    "mapped_rxn_environment": 3774160,
+    "none": 394175
+  },
+  "reaction_center_status_counts": {
+    "no_mapped_rxn": 394175,
+    "ok": 3774160
+  },
+  "records": 4168335,
+  "rsmiles_status_counts": {
+    "ok": 3773931,
+    "rsmiles_failed": 229,
+    "rxnmapper_failed": 394175
+  },
+  "view_count_histogram": {
+    "0": 394404,
+    "10": 12,
+    "11": 32,
+    "12": 38,
+    "13": 83,
+    "14": 162,
+    "15": 314,
+    "16": 626,
+    "17": 1435,
+    "18": 4733,
+    "19": 39117,
+    "2": 1,
+    "20": 3727368,
+    "6": 3,
+    "8": 1,
+    "9": 6
+  }
+}

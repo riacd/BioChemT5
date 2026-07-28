@@ -1,0 +1,12 @@
+{
+  "assignment_rows_scanned": 59838419,
+  "assignments_tsv_gz": "/mnt/shared-storage-gpfs2/veus/migration_reaction_package_20260529/data/Reaction_gen/results/screen_then_dedup_merged/r2_non_pubchem_plus_r2_incremental_20260513_143420/stage01_finalbio_dgbyg_api_equivalent_enzymemap_merged/drfp_template_clusters/full_sim095_r3_rings_official_complete_combined_fast5_h2002/final_assignments.sim095_r3_rings_official_complete_combined_fast5.tsv.gz",
+  "build_elapsed_s": 380.55458664894104,
+  "centers_loaded": 4168335,
+  "cluster_sizes_are_partial": false,
+  "elapsed_s": 29.589826583862305,
+  "input_jsonl": "/mnt/shared-storage-gpfs2/veus/migration_reaction_package_20260529/data/Reaction_gen/results/screen_then_dedup_merged/r2_non_pubchem_plus_r2_incremental_20260513_143420/stage01_finalbio_dgbyg_api_equivalent_enzymemap_merged/reactions_finalbio.dedup_by_rxn_ec.dgbyg_api_equivalent.enzymemap_merged.dgr_negative.jsonl",
+  "missing_center_records_after_scan": 0,
+  "out_jsonl": "/mnt/shared-storage-gpfs2/veus/migration_reaction_package_20260529/data/BiochemT5/pretrain_corpus/cluster_centers.sim095_r3_complete.jsonl",
+  "written": 4168335
+}

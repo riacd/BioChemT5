@@ -1,0 +1,8 @@
+# Minimal dependency hints for BiochemT5 reaction data augmentation.
+# Prefer conda for rdkit; use env/environment.biochem_t5_py311.yml when possible.
+numpy
+rdkit
+rxnmapper
+torch
+textdistance
+pytest

@@ -1,0 +1,6 @@
+torch
+transformers
+PyYAML
+wandb
+pytest
+rdkit

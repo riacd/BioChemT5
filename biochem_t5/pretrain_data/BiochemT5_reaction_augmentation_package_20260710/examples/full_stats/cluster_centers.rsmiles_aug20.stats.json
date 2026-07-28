@@ -1,0 +1,19 @@
+{
+  "augmentation": 20,
+  "chunk_size": 64,
+  "elapsed_s": 17622.17443370819,
+  "input_jsonl": "/mnt/shared-storage-gpfs2/veus/migration_reaction_package_20260529/data/BiochemT5/pretrain_corpus/cluster_centers.sim095_r3_complete.jsonl",
+  "map_batch_size": 16,
+  "out_jsonl": "/mnt/shared-storage-gpfs2/veus/migration_reaction_package_20260529/data/BiochemT5/pretrain_corpus/cluster_centers.rsmiles_aug20.jsonl",
+  "records_written_this_run": 4168335,
+  "rsmiles_repo": "/mnt/shared-storage-gpfs2/veus/migration_reaction_package_20260529/Rsmiles-main",
+  "skipped_existing_records": 0,
+  "status_counts": {
+    "ok": 3773931,
+    "rsmiles_failed": 229,
+    "rxnmapper_failed": 394175
+  },
+  "total_rsmiles_views": 75478620,
+  "total_unique_rsmiles_views": 75419255,
+  "workers": 120
+}

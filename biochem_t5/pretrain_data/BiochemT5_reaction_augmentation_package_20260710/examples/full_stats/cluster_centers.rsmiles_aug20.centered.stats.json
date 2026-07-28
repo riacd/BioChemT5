@@ -1,0 +1,52 @@
+{
+  "center_atom_count_histogram": {
+    "0": 394175,
+    "10": 233314,
+    "11": 316229,
+    "12": 150693,
+    "13": 302258,
+    "14": 182956,
+    "15": 181788,
+    "16": 177757,
+    "17": 142666,
+    "18": 120638,
+    "19": 106669,
+    "2": 64,
+    "20": 107003,
+    "21-50": 577967,
+    "3": 2388,
+    "4": 12356,
+    "5": 96973,
+    "51-100": 8045,
+    "6": 206591,
+    "7": 441088,
+    "8": 235072,
+    "9": 171636,
+    ">100": 9
+  },
+  "chunk_size": 512,
+  "elapsed_s": 550.2427349090576,
+  "input_jsonl": "/mnt/shared-storage-gpfs2/veus/migration_reaction_package_20260529/data/BiochemT5/pretrain_corpus/cluster_centers.rsmiles_aug20.jsonl",
+  "out_jsonl": "/mnt/shared-storage-gpfs2/veus/migration_reaction_package_20260529/data/BiochemT5/pretrain_corpus/cluster_centers.rsmiles_aug20.centered.jsonl",
+  "reaction_center_version": "mapped_rxn_environment_v1",
+  "records_without_ec_filled": 2939,
+  "records_written_this_run": 4168335,
+  "rsmiles_status_counts": {
+    "ok": 3773931,
+    "rsmiles_failed": 229,
+    "rxnmapper_failed": 394175
+  },
+  "skipped_existing_records": 0,
+  "source_counts": {
+    "mapped_rxn_environment": 3774160,
+    "none": 394175
+  },
+  "status_counts": {
+    "no_mapped_rxn": 394175,
+    "ok": 3774160
+  },
+  "total_center_atom_maps": 52223467,
+  "total_changed_atom_maps": 27073147,
+  "total_neighbor_atom_maps": 25150320,
+  "workers": 120
+}
