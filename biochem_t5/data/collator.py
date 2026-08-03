@@ -37,6 +37,7 @@ class PretrainCollator:
     mlm_use_mapped_rxn: bool = True
     ec_views_per_record: int = 1
     seq2seq_enabled: bool = True
+    include_ec: bool = True
 
     def __post_init__(self) -> None:
         self.rng = random.Random(self.seed)
@@ -105,24 +106,28 @@ class PretrainCollator:
                 source_ids.append(src)
                 target_ids.append(tgt)
 
-            if self.ec_views_per_record == 1:
-                ec_texts = [build_ec_reaction_view(record, self.rng)]
-            else:
-                ec_texts = list(build_ec_reaction_views(record, self.rng))
-            levels = record.get("ec_levels") if isinstance(record.get("ec_levels"), dict) else {}
-            for text in ec_texts:
-                ec_ids.append(self._encode_source(text))
-                ec_pair_ids.append(pair_id if self.ec_views_per_record == 2 else len(ec_pair_ids))
-                ec_level_sets.append({key: list(levels.get(key) or []) for key in ("ec1", "ec2", "ec3", "ec4")})
+            if self.include_ec:
+                if self.ec_views_per_record == 1:
+                    ec_texts = [build_ec_reaction_view(record, self.rng)]
+                else:
+                    ec_texts = list(build_ec_reaction_views(record, self.rng))
+                levels = record.get("ec_levels") if isinstance(record.get("ec_levels"), dict) else {}
+                for text in ec_texts:
+                    ec_ids.append(self._encode_source(text))
+                    ec_pair_ids.append(pair_id if self.ec_views_per_record == 2 else len(ec_pair_ids))
+                    ec_level_sets.append({key: list(levels.get(key) or []) for key in ("ec1", "ec2", "ec3", "ec4")})
 
-        ec_input_ids, ec_attention_mask = pad_sequences(ec_ids, self.tokenizer.pad_token_id)
-        batch = {
-            "tasks": tasks,
-            "ec_input_ids": torch.tensor(ec_input_ids, dtype=torch.long),
-            "ec_attention_mask": torch.tensor(ec_attention_mask, dtype=torch.long),
-            "ec_pair_ids": torch.tensor(ec_pair_ids, dtype=torch.long),
-            "ec_level_sets": ec_level_sets,
-        }
+        batch = {"tasks": tasks}
+        if self.include_ec:
+            ec_input_ids, ec_attention_mask = pad_sequences(ec_ids, self.tokenizer.pad_token_id)
+            batch.update(
+                {
+                    "ec_input_ids": torch.tensor(ec_input_ids, dtype=torch.long),
+                    "ec_attention_mask": torch.tensor(ec_attention_mask, dtype=torch.long),
+                    "ec_pair_ids": torch.tensor(ec_pair_ids, dtype=torch.long),
+                    "ec_level_sets": ec_level_sets,
+                }
+            )
         if self.seq2seq_enabled:
             input_ids, attention_mask = pad_sequences(source_ids, self.tokenizer.pad_token_id)
             labels, _ = pad_sequences(target_ids, self.tokenizer.pad_token_id)

@@ -13,17 +13,30 @@ import torch.distributed as dist
 import yaml
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, DistributedSampler
-from transformers import T5ForConditionalGeneration, get_linear_schedule_with_warmup
+from transformers import get_linear_schedule_with_warmup
 
+from biochem_t5.benchmark.common import write_json
 from biochem_t5.data.smiles_tokenizer import SmilesTokenizer
+from biochem_t5.models.factory import (
+    conditional_forward,
+    enable_gradient_checkpointing,
+    load_conditional_model,
+    resize_token_embeddings,
+    save_conditional_model,
+)
 
 from .data import (
-    RetrosynthesisCollator,
-    RetrosynthesisDataset,
-    load_retrosynthesis_splits,
+    DEFAULT_TASK_TOKEN,
+    ForwardPredictionCollator,
+    ForwardPredictionDataset,
+    extend_tokenizer,
+    extension_tokens,
+    load_forward_prediction_splits,
     tokenizer_audit,
-    write_json,
 )
+
+
+STATE_FILENAME = "forward_prediction_state.pt"
 
 
 def _load_config(path: str | Path) -> dict[str, Any]:
@@ -52,7 +65,7 @@ def _barrier() -> None:
         dist.barrier()
 
 
-def _unwrap(model: torch.nn.Module) -> T5ForConditionalGeneration:
+def _unwrap(model: torch.nn.Module) -> torch.nn.Module:
     return model.module if isinstance(model, DistributedDataParallel) else model  # type: ignore[return-value]
 
 
@@ -83,7 +96,7 @@ def _save_checkpoint(
 ) -> None:
     directory.mkdir(parents=True, exist_ok=True)
     unwrapped = _unwrap(model)
-    unwrapped.save_pretrained(directory / "t5", safe_serialization=False)
+    save_conditional_model(unwrapped, directory)
     tokenizer.save(directory / "smiles_vocab.json")
     checkpoint = {
         **state,
@@ -91,7 +104,7 @@ def _save_checkpoint(
         "scheduler": scheduler.state_dict(),
         "rng": _rng_state(),
     }
-    state_path = directory / "retrosynthesis_state.pt"
+    state_path = directory / STATE_FILENAME
     temporary = state_path.with_suffix(state_path.suffix + ".tmp")
     torch.save(checkpoint, temporary)
     temporary.replace(state_path)
@@ -107,28 +120,48 @@ def _resolve_resume_checkpoint(train_cfg: dict[str, Any], output_dir: Path) -> P
         path = Path(str(value))
         if path.is_file():
             path = path.parent
-        if not (path / "retrosynthesis_state.pt").is_file():
+        if not (path / STATE_FILENAME).is_file():
             raise FileNotFoundError(f"Resume checkpoint does not exist: {path}")
         return path
     latest = output_dir / "latest"
-    if bool(train_cfg.get("auto_resume", False)) and (latest / "retrosynthesis_state.pt").is_file():
+    if bool(train_cfg.get("auto_resume", False)) and (latest / STATE_FILENAME).is_file():
         return latest
     return None
 
 
 def _load_training_state(
     directory: Path,
-    model: T5ForConditionalGeneration,
     optimizer: torch.optim.Optimizer,
     scheduler: torch.optim.lr_scheduler.LRScheduler,
 ) -> dict[str, Any]:
-    checkpoint = torch.load(directory / "retrosynthesis_state.pt", map_location="cpu", weights_only=False)
-    if "model" in checkpoint:
-        model.load_state_dict(checkpoint["model"])
+    checkpoint = torch.load(directory / STATE_FILENAME, map_location="cpu", weights_only=False)
     optimizer.load_state_dict(checkpoint["optimizer"])
     scheduler.load_state_dict(checkpoint["scheduler"])
     _restore_rng_state(checkpoint.get("rng", {}))
     return checkpoint
+
+
+def _resize_and_initialize(
+    model: torch.nn.Module,
+    tokenizer: SmilesTokenizer,
+    old_vocab_size: int,
+    task_token: str,
+    initialize_from: str,
+) -> None:
+    if len(tokenizer) == old_vocab_size:
+        return
+    try:
+        resize_token_embeddings(model, len(tokenizer))
+    except TypeError:
+        resize_token_embeddings(model, len(tokenizer))
+    if task_token in tokenizer.token_to_id and initialize_from in tokenizer.token_to_id:
+        task_id = tokenizer.token_to_id[task_token]
+        source_id = tokenizer.token_to_id[initialize_from]
+        if task_id >= old_vocab_size:
+            with torch.no_grad():
+                model.get_input_embeddings().weight[task_id].copy_(
+                    model.get_input_embeddings().weight[source_id]
+                )
 
 
 @torch.no_grad()
@@ -145,7 +178,7 @@ def _validation_loss(model: torch.nn.Module, loader: DataLoader, device: torch.d
         batch = {key: value.to(device) for key, value in batch.items()}
         tokens = batch["labels"].ne(-100).sum()
         with autocast:
-            output = model(**batch)
+            output = conditional_forward(model, batch)
         loss_sum += output.loss.detach().double() * tokens
         token_count += tokens
     if dist.is_initialized():
@@ -160,6 +193,7 @@ def train(config_path: str | Path) -> dict[str, Any]:
     distributed, rank, local_rank, world_size = _init_distributed()
     train_cfg = config["training"]
     data_cfg = config["data"]
+    vocab_cfg = config.get("vocabulary", {})
     output_dir = Path(config["output_dir"])
     seed = int(train_cfg.get("seed", 13))
     random.seed(seed + rank)
@@ -168,16 +202,48 @@ def train(config_path: str | Path) -> dict[str, Any]:
         torch.cuda.manual_seed_all(seed + rank)
     device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
 
-    splits, manifest = load_retrosynthesis_splits(
+    splits, manifest = load_forward_prediction_splits(
         data_cfg["train_csv"], data_cfg["val_csv"], data_cfg["test_csv"]
     )
     pretrained = Path(config["pretrained_checkpoint"])
-    tokenizer = SmilesTokenizer.load(pretrained / "smiles_vocab.json")
+    task_token = str(vocab_cfg.get("task_token", DEFAULT_TASK_TOKEN))
+    initialize_from = str(vocab_cfg.get("initialize_task_from", "<forward>"))
     source_max_length = int(data_cfg.get("source_max_length", 512))
     target_max_length = int(data_cfg.get("target_max_length", 512))
+    resume_dir = _resolve_resume_checkpoint(train_cfg, output_dir)
+    base_tokenizer = SmilesTokenizer.load(pretrained / "smiles_vocab.json")
+    extension_split_names = [str(name) for name in vocab_cfg.get("extend_from_splits", ["train"])]
+    unknown_extension_splits = sorted(set(extension_split_names) - set(splits))
+    if unknown_extension_splits:
+        raise ValueError(f"Unknown vocabulary extension splits: {unknown_extension_splits}")
+    if resume_dir is None:
+        missing_tokens: set[str] = set()
+        for split_name in extension_split_names:
+            missing_tokens.update(extension_tokens(base_tokenizer, splits[split_name], task_token))
+        added_tokens = [task_token] if task_token in missing_tokens else []
+        added_tokens.extend(sorted(missing_tokens - {task_token}))
+        tokenizer = extend_tokenizer(base_tokenizer, added_tokens)
+    else:
+        tokenizer = SmilesTokenizer.load(resume_dir / "smiles_vocab.json")
+        added_tokens = [
+            token
+            for token, token_id in sorted(tokenizer.token_to_id.items(), key=lambda item: item[1])
+            if token_id >= len(base_tokenizer)
+        ]
+
     manifest["tokenizer"] = {
-        name: tokenizer_audit(tokenizer, products, source_max_length, target_max_length)
-        for name, products in splits.items()
+        "base_vocab_size": len(base_tokenizer),
+        "extended_vocab_size": len(tokenizer),
+        "added_tokens": added_tokens,
+        "extension_splits": extension_split_names,
+        "audit_before_extension": {
+            name: tokenizer_audit(base_tokenizer, substrates, source_max_length, target_max_length, task_token)
+            for name, substrates in splits.items()
+        },
+        "audit_after_extension": {
+            name: tokenizer_audit(tokenizer, substrates, source_max_length, target_max_length, task_token)
+            for name, substrates in splits.items()
+        },
     }
     if rank == 0:
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -187,19 +253,25 @@ def train(config_path: str | Path) -> dict[str, Any]:
         )
     _barrier()
 
-    train_dataset = RetrosynthesisDataset(splits["train"])
-    val_dataset = RetrosynthesisDataset(splits["val"])
+    train_dataset = ForwardPredictionDataset(splits["train"])
+    val_dataset = ForwardPredictionDataset(splits["val"])
     if not train_dataset:
-        raise ValueError("Training split contains no valid reaction pairs")
+        raise ValueError("Training split contains no valid forward-prediction pairs")
     if not val_dataset:
-        raise ValueError("Validation split contains no valid reaction pairs")
-    collator = RetrosynthesisCollator(tokenizer, source_max_length, target_max_length)
-    train_sampler = DistributedSampler(
-        train_dataset, num_replicas=world_size, rank=rank, shuffle=True, seed=seed
-    ) if distributed else None
-    val_sampler = DistributedSampler(
-        val_dataset, num_replicas=world_size, rank=rank, shuffle=False
-    ) if distributed else None
+        raise ValueError("Validation split contains no valid forward-prediction pairs")
+    collator = ForwardPredictionCollator(
+        tokenizer, source_max_length, target_max_length, task_token
+    )
+    train_sampler = (
+        DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True, seed=seed)
+        if distributed
+        else None
+    )
+    val_sampler = (
+        DistributedSampler(val_dataset, num_replicas=world_size, rank=rank, shuffle=False)
+        if distributed
+        else None
+    )
     batch_size = int(train_cfg.get("per_device_batch_size", 16))
     workers = int(train_cfg.get("num_workers", 0))
     train_loader = DataLoader(
@@ -220,14 +292,13 @@ def train(config_path: str | Path) -> dict[str, Any]:
         pin_memory=device.type == "cuda",
     )
 
-    resume_dir = _resolve_resume_checkpoint(train_cfg, output_dir)
-    model_source = resume_dir / "t5" if resume_dir is not None else pretrained / "t5"
-    model = T5ForConditionalGeneration.from_pretrained(model_source)
+    model = load_conditional_model(resume_dir if resume_dir is not None else pretrained)
+    if resume_dir is None:
+        _resize_and_initialize(model, tokenizer, len(base_tokenizer), task_token, initialize_from)
     if len(tokenizer) != model.config.vocab_size:
         raise ValueError(f"Tokenizer/model vocabulary mismatch: {len(tokenizer)} != {model.config.vocab_size}")
     if bool(train_cfg.get("gradient_checkpointing", True)):
-        model.gradient_checkpointing_enable()
-        model.config.use_cache = False
+        enable_gradient_checkpointing(model)
     model.to(device)
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -249,8 +320,8 @@ def train(config_path: str | Path) -> dict[str, Any]:
         "metrics": {"validations": []},
     }
     if resume_dir is not None:
-        state.update(_load_training_state(resume_dir, model, optimizer, scheduler))
-        for key in ("model", "optimizer", "scheduler", "rng"):
+        state.update(_load_training_state(resume_dir, optimizer, scheduler))
+        for key in ("optimizer", "scheduler", "rng"):
             state.pop(key, None)
     if distributed:
         model = DistributedDataParallel(
@@ -289,7 +360,7 @@ def train(config_path: str | Path) -> dict[str, Any]:
             group_start = (batch_index // gradient_accumulation) * gradient_accumulation
             group_size = min(gradient_accumulation, len(train_loader) - group_start)
             with sync_context, autocast:
-                loss = model(**batch).loss / group_size
+                loss = conditional_forward(model, batch).loss / group_size
                 loss.backward()
             next_batch = batch_index + 1
             state["epoch"] = epoch + int(next_batch == len(train_loader))
@@ -328,7 +399,7 @@ def train(config_path: str | Path) -> dict[str, Any]:
         epoch += 1
         resume_batch = 0
 
-    if rank == 0 and not (output_dir / "latest" / "retrosynthesis_state.pt").exists():
+    if rank == 0 and not (output_dir / "latest" / STATE_FILENAME).exists():
         _save_checkpoint(output_dir / "latest", model, tokenizer, optimizer, scheduler, state, config)
         _save_checkpoint(output_dir / "best", model, tokenizer, optimizer, scheduler, state, config)
     _barrier()
@@ -338,7 +409,7 @@ def train(config_path: str | Path) -> dict[str, Any]:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Fine-tune BioChemT5 for retrosynthesis")
+    parser = argparse.ArgumentParser(description="Fine-tune BioChemT5 for single-product forward prediction")
     parser.add_argument("--config", required=True)
     args = parser.parse_args()
     train(args.config)

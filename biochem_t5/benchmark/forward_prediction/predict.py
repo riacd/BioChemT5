@@ -4,85 +4,59 @@ import argparse
 import hashlib
 import json
 import os
+import random
 from pathlib import Path
 from typing import Any, Iterable
 
 import torch
 import yaml
 from rdkit import Chem
-from transformers import T5ForConditionalGeneration
 
+from biochem_t5.benchmark.common import canonicalize_smiles_set
+from biochem_t5.benchmark.retrosynthesis.predict import fuse_candidates
 from biochem_t5.data.smiles_tokenizer import SmilesTokenizer
+from biochem_t5.models.factory import generate_conditional, load_conditional_model
 
-from .data import canonicalize_smiles_set, encode_with_limit, load_retrosynthesis_csv
+from .data import DEFAULT_TASK_TOKEN, encode_with_limit, forward_source, load_forward_prediction_csv
 
 
-def randomized_product_smiles(product: str, count: int, seed: int) -> list[str]:
+def randomized_substrate_smiles(substrate: str, count: int, seed: int) -> list[str]:
     if count < 1:
         raise ValueError("augmentation must be at least 1")
-    canonical = canonicalize_smiles_set(product)
+    canonical = canonicalize_smiles_set(substrate)
     if canonical is None:
-        raise ValueError(f"Invalid product SMILES: {product}")
+        raise ValueError(f"Invalid substrate SMILES: {substrate}")
     if count == 1:
         return [canonical]
-    mol = Chem.MolFromSmiles(canonical)
-    if mol is None:
-        raise ValueError(f"Invalid canonical product SMILES: {canonical}")
-    generated: list[str]
-    if hasattr(Chem, "MolToRandomSmilesVect"):
-        generated = list(
-            Chem.MolToRandomSmilesVect(
-                mol,
-                count - 1,
-                randomSeed=int(seed),
-                isomericSmiles=True,
-            )
-        )
-    else:
-        from rdkit import rdBase
 
-        rdBase.SeedRandomNumberGenerator(int(seed))
-        generated = [Chem.MolToSmiles(mol, canonical=False, doRandom=True, isomericSmiles=True) for _ in range(count - 1)]
-    return [canonical, *generated]
-
-
-def fuse_candidates(augmentation_candidates: Iterable[Iterable[dict[str, Any]]], top_k: int = 10) -> list[dict[str, Any]]:
-    aggregated: dict[str, dict[str, Any]] = {}
-    for augmentation_index, candidates in enumerate(augmentation_candidates):
-        seen_in_augmentation: set[str] = set()
-        for candidate in candidates:
-            canonical = candidate.get("canonical")
-            if not canonical or canonical in seen_in_augmentation:
-                continue
-            seen_in_augmentation.add(canonical)
-            rank = int(candidate["rank"])
-            score = float(candidate.get("sequence_score", float("-inf")))
-            item = aggregated.setdefault(
-                canonical,
-                {
-                    "smiles": canonical,
-                    "reciprocal_rank": 0.0,
-                    "best_rank": rank,
-                    "best_sequence_score": score,
-                    "augmentation_hits": 0,
-                    "ranks": {},
-                },
-            )
-            item["reciprocal_rank"] += 1.0 / (60 + rank)
-            item["best_rank"] = min(int(item["best_rank"]), rank)
-            item["best_sequence_score"] = max(float(item["best_sequence_score"]), score)
-            item["augmentation_hits"] += 1
-            item["ranks"][str(augmentation_index)] = rank
-    ranked = sorted(
-        aggregated.values(),
-        key=lambda item: (
-            -float(item["reciprocal_rank"]),
-            int(item["best_rank"]),
-            -float(item["best_sequence_score"]),
-            str(item["smiles"]),
-        ),
-    )
-    return ranked[:top_k]
+    parts = canonical.split(".")
+    generated = [canonical]
+    for augmentation_index in range(1, count):
+        randomized_parts: list[str] = []
+        for part_index, part in enumerate(parts):
+            mol = Chem.MolFromSmiles(part)
+            if mol is None:
+                raise ValueError(f"Invalid canonical substrate fragment: {part}")
+            digest = hashlib.sha1(
+                f"{seed}:{augmentation_index}:{part_index}:{part}".encode("utf-8")
+            ).digest()
+            part_seed = int.from_bytes(digest[:4], "big") & 0x7FFFFFFF
+            if hasattr(Chem, "MolToRandomSmilesVect"):
+                randomized = Chem.MolToRandomSmilesVect(
+                    mol,
+                    1,
+                    randomSeed=part_seed,
+                    isomericSmiles=True,
+                )[0]
+            else:
+                randomized = Chem.MolToSmiles(
+                    mol, canonical=False, doRandom=True, isomericSmiles=True
+                )
+            randomized_parts.append(randomized)
+        order_rng = random.Random(f"{seed}:{augmentation_index}:{canonical}")
+        order_rng.shuffle(randomized_parts)
+        generated.append(".".join(randomized_parts))
+    return generated
 
 
 def _decode_sequence(tokenizer: SmilesTokenizer, ids: Iterable[int]) -> str:
@@ -101,9 +75,13 @@ def _encode_sources(
     tokenizer: SmilesTokenizer,
     sources: list[str],
     max_length: int,
+    task_token: str,
     device: torch.device,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    rows = [encode_with_limit(tokenizer, f"<retro>{source}", max_length)[0] for source in sources]
+    rows = [
+        encode_with_limit(tokenizer, forward_source(source, task_token), max_length)[0]
+        for source in sources
+    ]
     width = max(len(row) for row in rows)
     input_ids = torch.full((len(rows), width), tokenizer.pad_token_id, dtype=torch.long, device=device)
     attention_mask = torch.zeros((len(rows), width), dtype=torch.long, device=device)
@@ -113,7 +91,7 @@ def _encode_sources(
     return input_ids, attention_mask
 
 
-def _read_completed_products(path: Path) -> set[str]:
+def _read_completed_substrates(path: Path) -> set[str]:
     completed: set[str] = set()
     if not path.exists():
         return completed
@@ -125,10 +103,10 @@ def _read_completed_products(path: Path) -> set[str]:
                 payload = json.loads(line)
             except json.JSONDecodeError as exc:
                 raise ValueError(f"Invalid existing JSONL at {path}:{line_number}") from exc
-            product = payload.get("product")
-            if not isinstance(product, str) or product in completed:
-                raise ValueError(f"Invalid or duplicate product in existing predictions: {product!r}")
-            completed.add(product)
+            substrate = payload.get("substrate")
+            if not isinstance(substrate, str) or substrate in completed:
+                raise ValueError(f"Invalid or duplicate substrate in existing predictions: {substrate!r}")
+            completed.add(substrate)
     return completed
 
 
@@ -153,31 +131,38 @@ def predict(
     output = Path(output)
     output.parent.mkdir(parents=True, exist_ok=True)
     tokenizer = SmilesTokenizer.load(checkpoint / "smiles_vocab.json")
-    model = T5ForConditionalGeneration.from_pretrained(checkpoint / "t5")
+    model = load_conditional_model(checkpoint)
+    if len(tokenizer) != model.config.vocab_size:
+        raise ValueError(f"Tokenizer/model vocabulary mismatch: {len(tokenizer)} != {model.config.vocab_size}")
     target_device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
     model.to(target_device)
     model.eval()
     source_max_length = 512
+    task_token = DEFAULT_TASK_TOKEN
     config_path = checkpoint / "resolved_config.yaml"
     if config_path.is_file():
         resolved = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
         source_max_length = int(resolved.get("data", {}).get("source_max_length", source_max_length))
+        task_token = str(resolved.get("vocabulary", {}).get("task_token", task_token))
 
-    products = sorted(load_retrosynthesis_csv(test_csv).products)
-    completed = _read_completed_products(output) if resume else set()
+    substrates = sorted(load_forward_prediction_csv(test_csv).substrates)
+    completed = _read_completed_substrates(output) if resume else set()
     mode = "a" if resume and output.exists() else "w"
-    pending = [product for product in products if product not in completed]
+    pending = [substrate for substrate in substrates if substrate not in completed]
     with output.open(mode, encoding="utf-8") as handle:
         for start in range(0, len(pending), batch_size):
-            product_batch = pending[start : start + batch_size]
-            augmented = []
-            for product in product_batch:
-                digest = hashlib.sha1(f"{seed}:{product}".encode("utf-8")).digest()
-                product_seed = int.from_bytes(digest[:4], "big") & 0x7FFFFFFF
-                augmented.append(randomized_product_smiles(product, augmentation, product_seed))
+            substrate_batch = pending[start : start + batch_size]
+            augmented: list[list[str]] = []
+            for substrate in substrate_batch:
+                digest = hashlib.sha1(f"{seed}:{substrate}".encode("utf-8")).digest()
+                substrate_seed = int.from_bytes(digest[:4], "big") & 0x7FFFFFFF
+                augmented.append(randomized_substrate_smiles(substrate, augmentation, substrate_seed))
             flat_sources = [source for sources in augmented for source in sources]
-            input_ids, attention_mask = _encode_sources(tokenizer, flat_sources, source_max_length, target_device)
-            generation = model.generate(
+            input_ids, attention_mask = _encode_sources(
+                tokenizer, flat_sources, source_max_length, task_token, target_device
+            )
+            generation = generate_conditional(
+                model,
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 num_beams=num_beams,
@@ -187,6 +172,11 @@ def predict(
                 early_stopping=True,
                 return_dict_in_generate=True,
                 output_scores=True,
+                diffusion_steps=64,
+                temperature=0.5,
+                candidate_validator=lambda ids: canonicalize_smiles_set(
+                    _decode_sequence(tokenizer, ids)
+                ) is not None,
             )
             sequences = generation.sequences.detach().cpu()
             if generation.sequences_scores is None:
@@ -194,13 +184,13 @@ def predict(
             else:
                 sequence_scores = generation.sequences_scores.detach().float().cpu().tolist()
 
-            rows_per_product = augmentation * num_return_sequences
-            for product_index, product in enumerate(product_batch):
+            rows_per_substrate = augmentation * num_return_sequences
+            for substrate_index, substrate in enumerate(substrate_batch):
                 raw_augmentations: list[dict[str, Any]] = []
                 candidates_for_fusion: list[list[dict[str, Any]]] = []
                 invalid_count = 0
-                for augmentation_index, source in enumerate(augmented[product_index]):
-                    base = product_index * rows_per_product + augmentation_index * num_return_sequences
+                for augmentation_index, source in enumerate(augmented[substrate_index]):
+                    base = substrate_index * rows_per_substrate + augmentation_index * num_return_sequences
                     candidates: list[dict[str, Any]] = []
                     for rank in range(1, num_return_sequences + 1):
                         result_index = base + rank - 1
@@ -216,13 +206,16 @@ def predict(
                                 "valid": canonical is not None,
                             }
                         )
+                    candidates.sort(key=lambda item: float(item["sequence_score"]), reverse=True)
+                    for candidate_rank, candidate in enumerate(candidates, start=1):
+                        candidate["rank"] = candidate_rank
                     raw_augmentations.append({"input": source, "candidates": candidates})
                     candidates_for_fusion.append(candidates)
                 fused = fuse_candidates(candidates_for_fusion, top_k=top_k)
                 payload = {
-                    "product": product,
+                    "substrate": substrate,
                     "augmentation": augmentation,
-                    "augmentation_inputs": augmented[product_index],
+                    "augmentation_inputs": augmented[substrate_index],
                     "raw_augmentations": raw_augmentations,
                     "fused_candidates": fused,
                     "statistics": {
@@ -238,7 +231,7 @@ def predict(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Generate retrosynthesis predictions")
+    parser = argparse.ArgumentParser(description="Generate single-product forward predictions")
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--test-csv", required=True)
     parser.add_argument("--output", required=True)

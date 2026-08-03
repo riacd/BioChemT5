@@ -1,17 +1,15 @@
 from __future__ import annotations
 
 import csv
-import hashlib
-import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Mapping, Sequence
 
 import torch
-from rdkit import Chem, rdBase
 from torch.utils.data import Dataset
 
 from biochem_t5.data.smiles_tokenizer import SmilesTokenizer
+from biochem_t5.benchmark.common import canonicalize_smiles_set, sha256_file
 
 
 @dataclass
@@ -19,48 +17,6 @@ class CsvLoadResult:
     path: Path
     products: dict[str, list[str]]
     stats: dict[str, int]
-
-
-def _canonicalize_molecule(smiles: str) -> str | None:
-    with rdBase.BlockLogs():
-        mol = Chem.MolFromSmiles(smiles)
-    if mol is None:
-        return None
-    for atom in mol.GetAtoms():
-        atom.SetAtomMapNum(0)
-    return Chem.MolToSmiles(mol, canonical=True, isomericSmiles=True)
-
-
-def canonicalize_smiles_set(smiles: str) -> str | None:
-    """Canonicalize a dot-separated molecule set with order-independent parts."""
-    text = "".join(str(smiles).split())
-    if not text:
-        return None
-    parts: list[str] = []
-    for part in text.split("."):
-        if not part:
-            return None
-        canonical = _canonicalize_molecule(part)
-        if canonical is None:
-            return None
-        parts.append(canonical)
-    return ".".join(sorted(parts))
-
-
-def largest_fragment(smiles: str) -> str | None:
-    canonical = canonicalize_smiles_set(smiles)
-    if canonical is None:
-        return None
-    ranked: list[tuple[int, int, str]] = []
-    for part in canonical.split("."):
-        with rdBase.BlockLogs():
-            mol = Chem.MolFromSmiles(part)
-        if mol is None:
-            return None
-        ranked.append((mol.GetNumHeavyAtoms(), mol.GetNumAtoms(), part))
-    return max(ranked)[2]
-
-
 def load_retrosynthesis_csv(
     path: str | Path,
     product_column: str = "product_smiles",
@@ -111,14 +67,6 @@ def load_retrosynthesis_csv(
     stats["unique_products"] = len(products)
     stats["unique_pairs"] = sum(len(targets) for targets in products.values())
     return CsvLoadResult(path=path, products=products, stats=stats)
-
-
-def sha256_file(path: str | Path) -> str:
-    digest = hashlib.sha256()
-    with Path(path).open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def load_retrosynthesis_splits(
@@ -242,15 +190,3 @@ class RetrosynthesisCollator:
         for row, ids in enumerate(target_ids):
             labels[row, : len(ids)] = torch.tensor(ids, dtype=torch.long)
         return {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels}
-
-
-def write_json(path: str | Path, payload: Any) -> None:
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    temporary.replace(path)
-
-
-def iter_products(products: Mapping[str, Iterable[str]]) -> list[str]:
-    return sorted(products)

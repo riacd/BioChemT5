@@ -8,7 +8,8 @@ from typing import Iterable
 
 
 SMILES_REGEX = re.compile(
-    r"(</s>|<pad>|<unk>|<forward>|<retro>|<mlm>|<ec>|<mask_product>|<mask_reactants>|<extra_id_\d+>|"
+    r"(</s>|<pad>|<unk>|<forward>|<retro>|<mlm>|<ec>|<mask>|<mask_product>|<mask_reactants>|<extra_id_\d+>|"
+    r"<[A-Za-z][A-Za-z0-9_]*>|"
     r"\[[^\]]+\]|>>|<-|->|"
     r"Bi|Br|Ge|Te|Mo|Mg|Na|Ca|Li|Al|Si|Se|Cl|Fe|Zn|Cu|Mn|Ni|Co|Pd|Pt|"
     r"@@?|%\d{2}|[A-Za-z]|\d|=|#|-|\+|\\|/|\.|:|~|@|\?|\*|\$|\(|\)|<|>)"
@@ -27,6 +28,7 @@ BASE_SPECIAL_TOKENS = [
     "<mask_reactants>",
 ]
 SENTINEL_TOKENS = [f"<extra_id_{idx}>" for idx in range(100)]
+MASK_TOKEN = "<mask>"
 
 
 def smiles_tokenize(text: str) -> list[str]:
@@ -55,6 +57,7 @@ class SmilesTokenizer:
         self.pad_token_id = self.token_to_id["<pad>"]
         self.eos_token_id = self.token_to_id["</s>"]
         self.unk_token_id = self.token_to_id["<unk>"]
+        self.mask_token_id = self.token_to_id.get(MASK_TOKEN)
 
     @classmethod
     def build(cls, texts: Iterable[str], vocab_size: int = 4096) -> "SmilesTokenizer":
@@ -87,6 +90,21 @@ class SmilesTokenizer:
 
     def token_id(self, token: str) -> int:
         return self.token_to_id.get(token, self.unk_token_id)
+
+    def add_tokens(self, tokens: Iterable[str]) -> list[str]:
+        added: list[str] = []
+        for token in tokens:
+            if token not in self.token_to_id:
+                token_id = len(self.token_to_id)
+                self.token_to_id[token] = token_id
+                self.id_to_token[token_id] = token
+                added.append(token)
+        self.mask_token_id = self.token_to_id.get(MASK_TOKEN)
+        return added
+
+    def ensure_mask_token(self) -> int:
+        self.add_tokens([MASK_TOKEN])
+        return self.token_to_id[MASK_TOKEN]
 
     def tokenize(self, text: str) -> list[str]:
         return smiles_tokenize(text)

@@ -16,19 +16,19 @@ from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, DistributedSampler
 from transformers import get_cosine_schedule_with_warmup
 
+from biochem_t5.benchmark.common import write_json
 from biochem_t5.data.smiles_tokenizer import SmilesTokenizer
 from biochem_t5.losses.ec_retrieval import gather_with_gradient, hierarchical_loss
 from biochem_t5.models.ec_retrieval import ECRetrievalModel
 
-from .ec_metrics import classification_metrics, exact_topk_euclidean
-from .ecreact import (
+from .metrics import classification_metrics, exact_topk_euclidean
+from .data import (
     HierarchicalBatchSampler,
     ReactionCollator,
     ReactionDataset,
     TripletCollator,
     TripletDataset,
     load_ecreact_csv,
-    write_json,
 )
 
 

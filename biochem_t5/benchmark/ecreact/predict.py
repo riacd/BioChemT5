@@ -11,10 +11,11 @@ import yaml
 from torch.utils.data import DataLoader
 
 from biochem_t5.data.smiles_tokenizer import SmilesTokenizer
+from biochem_t5.benchmark.common import write_json
 from biochem_t5.models.ec_retrieval import ECRetrievalModel
 
-from .ec_metrics import classification_metrics, exact_topk_euclidean, recall_at_k
-from .ecreact import ReactionCollator, ReactionDataset, ec_at_level, load_ecreact_csv, write_json
+from .metrics import classification_metrics, exact_topk_euclidean, recall_at_k
+from .data import ReactionCollator, ReactionDataset, ec_at_level, load_ecreact_csv
 
 
 @torch.no_grad()

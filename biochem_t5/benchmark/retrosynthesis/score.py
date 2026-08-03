@@ -1,3 +1,5 @@
+"""Score retrosynthesis predictions with unified top-k semantics."""
+
 from __future__ import annotations
 
 import argparse
@@ -6,11 +8,53 @@ import json
 from pathlib import Path
 from typing import Any
 
-from .data import write_json
-from .original.score_topk import canonicalize_smiles
+from rdkit import Chem, RDLogger
+
+from biochem_t5.benchmark.common import write_json
+
+
+RDLogger.DisableLog("rdApp.*")
 
 
 TOP_K_VALUES = tuple(range(1, 11))
+
+
+def canonicalize_smiles(smiles: str) -> str:
+    if smiles is None:
+        return ""
+    smiles = str(smiles).strip()
+    if not smiles:
+        return ""
+
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        return ""
+
+    for atom in mol.GetAtoms():
+        if atom.HasProp("molAtomMapNumber"):
+            atom.ClearProp("molAtomMapNumber")
+
+    try:
+        canonical = Chem.MolToSmiles(mol, isomericSmiles=True)
+    except Exception:
+        return ""
+
+    fragments = [fragment for fragment in canonical.split(".") if fragment]
+    fragments.sort()
+    return ".".join(fragments)
+
+
+def get_prediction_columns(
+    fieldnames: list[str],
+    prediction_prefix: str,
+    top_k: int,
+) -> list[str]:
+    columns = []
+    for index in range(1, top_k + 1):
+        name = f"{prediction_prefix}{index}"
+        if name in fieldnames:
+            columns.append(name)
+    return columns
 
 
 def _read_predictions(path: str | Path) -> tuple[dict[str, dict[str, Any]], int]:
@@ -66,20 +110,96 @@ def _candidate_strings(payload: dict[str, Any]) -> list[str]:
     return result
 
 
-def _canonical_candidates(payload: dict[str, Any], top_k: int) -> tuple[list[str], int]:
-    predictions: list[str] = []
-    seen: set[str] = set()
+def _rows_for_topk_scorer(
+    test_rows: list[dict[str, Any]],
+    predictions: dict[str, dict[str, Any]],
+    top_k: int,
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for test_row in test_rows:
+        candidates = _candidate_strings(predictions.get(test_row["product"], {}))[:top_k]
+        row = dict(test_row)
+        for rank in range(1, top_k + 1):
+            row[f"pred_{rank}"] = candidates[rank - 1] if rank <= len(candidates) else ""
+        rows.append(row)
+    return rows
+
+
+def _score_topk_rows(
+    rows: list[dict[str, Any]],
+    prediction_prefix: str = "pred_",
+    top_k: int = 10,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Canonicalize, deduplicate, and score row-wise top-k predictions."""
+    if not rows:
+        raise ValueError("No rows provided for scoring")
+
+    fieldnames = list(rows[0].keys())
+    prediction_cols = get_prediction_columns(fieldnames, prediction_prefix, top_k)
+    if not prediction_cols:
+        raise ValueError(
+            f"No prediction columns found with prefix '{prediction_prefix}'. "
+            f"Expected columns like {prediction_prefix}1, {prediction_prefix}2, ..."
+        )
+
+    hits = [0 for _ in range(len(prediction_cols))]
     invalid_predictions = 0
-    for value in _candidate_strings(payload)[:top_k]:
-        prediction = canonicalize_smiles(value)
-        if not prediction:
-            invalid_predictions += 1
-            continue
-        if prediction in seen:
-            continue
-        seen.add(prediction)
-        predictions.append(prediction)
-    return predictions, invalid_predictions
+    detail_rows: list[dict[str, Any]] = []
+
+    for idx, row in enumerate(rows):
+        sample_id = row.get("id", idx)
+        target = canonicalize_smiles(row.get("target", ""))
+        if not target:
+            raise ValueError(f"Invalid or empty target at row {idx} (id={sample_id})")
+
+        seen = set()
+        canonical_predictions = []
+        for col in prediction_cols:
+            prediction = canonicalize_smiles(row.get(col, ""))
+            if not prediction:
+                invalid_predictions += 1
+                continue
+            if prediction in seen:
+                continue
+            seen.add(prediction)
+            canonical_predictions.append(prediction)
+
+        matched_rank = None
+        for rank_idx, prediction in enumerate(canonical_predictions):
+            if prediction == target:
+                matched_rank = rank_idx + 1
+                break
+
+        if matched_rank is not None:
+            for k_idx in range(matched_rank - 1, len(hits)):
+                hits[k_idx] += 1
+
+        detail = {
+            "id": sample_id,
+            "product": row["product"],
+            "target": target,
+            "matched_rank": matched_rank,
+        }
+        for k_idx in range(len(prediction_cols)):
+            detail[f"top_{k_idx + 1}_hit"] = int(
+                matched_rank is not None and matched_rank <= k_idx + 1
+            )
+        detail_rows.append(detail)
+
+    total = len(rows)
+    metrics = {
+        "prediction_columns_used": prediction_cols,
+        "invalid_predictions": invalid_predictions,
+        "exact_match": {
+            f"top_{index}": hit_count / total
+            for index, hit_count in enumerate(hits, start=1)
+        },
+        "hit_counts": {
+            f"top_{index}": hit_count
+            for index, hit_count in enumerate(hits, start=1)
+        },
+    }
+    return metrics, detail_rows
 
 
 def score(
@@ -102,51 +222,17 @@ def score(
             f"missing={len(missing)}, extra={len(extra)}, duplicate={duplicate_products}"
         )
 
-    canonical_by_product: dict[str, list[str]] = {}
-    invalid_by_product: dict[str, int] = {}
-    for product, payload in predictions.items():
-        candidates, invalid_count = _canonical_candidates(payload, max(TOP_K_VALUES))
-        canonical_by_product[product] = candidates
-        invalid_by_product[product] = invalid_count
-
-    hits = {top_k: 0 for top_k in TOP_K_VALUES}
-    invalid_predictions = 0
-    details: list[dict[str, Any]] = []
-    for row in test_rows:
-        candidates = canonical_by_product.get(row["product"], [])
-        invalid_predictions += invalid_by_product.get(row["product"], 0)
-        matched_rank = next(
-            (
-                rank
-                for rank, prediction in enumerate(candidates, start=1)
-                if prediction == row["target"]
-            ),
-            None,
-        )
-        for top_k in TOP_K_VALUES:
-            hits[top_k] += int(matched_rank is not None and matched_rank <= top_k)
-        detail = {
-            "id": row["id"],
-            "product": row["product"],
-            "target": row["target"],
-            "matched_rank": matched_rank,
-        }
-        for top_k in TOP_K_VALUES:
-            detail[f"top_{top_k}_hit"] = int(
-                matched_rank is not None and matched_rank <= top_k
-            )
-        details.append(detail)
-
+    scoring_rows = _rows_for_topk_scorer(test_rows, predictions, max(TOP_K_VALUES))
+    topk_metrics, details = _score_topk_rows(
+        scoring_rows,
+        top_k=max(TOP_K_VALUES),
+    )
     total = len(test_rows)
     metrics: dict[str, Any] = {
+        "scoring_implementation": "biochem_t5/benchmark/retrosynthesis/score.py",
         "num_test_entries": total,
         "num_test_products": len(target_products),
-        "prediction_columns_used": [f"pred_{top_k}" for top_k in TOP_K_VALUES],
-        "invalid_predictions": invalid_predictions,
-        "exact_match": {
-            f"top_{top_k}": hits[top_k] / total for top_k in TOP_K_VALUES
-        },
-        "hit_counts": {f"top_{top_k}": hits[top_k] for top_k in TOP_K_VALUES},
+        **topk_metrics,
         "missing_products": len(missing),
         "extra_products": len(extra),
         "duplicate_products": duplicate_products,
@@ -163,10 +249,11 @@ def score(
 
     print(f"Samples: {total}")
     print("Prediction columns used: " + ", ".join(metrics["prediction_columns_used"]))
-    print(f"Invalid predictions skipped: {invalid_predictions}")
+    print(f"Invalid predictions skipped: {metrics['invalid_predictions']}")
     for top_k in TOP_K_VALUES:
         accuracy = metrics["exact_match"][f"top_{top_k}"]
-        print(f"Top-{top_k} Accuracy: {accuracy * 100:.3f}% ({hits[top_k]}/{total})")
+        hit_count = metrics["hit_counts"][f"top_{top_k}"]
+        print(f"Top-{top_k} Accuracy: {accuracy * 100:.3f}% ({hit_count}/{total})")
     return metrics
 
 

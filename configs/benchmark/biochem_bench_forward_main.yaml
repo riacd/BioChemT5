@@ -1,5 +1,5 @@
-pretrained_checkpoint: outputs/BiochemT5/production/biochem_bench_split/span_reaction_center_t5_base_100k
-output_dir: outputs/BiochemT5/benchmark/biochem_bench_split_span_reaction_center_retrosynthesis
+pretrained_checkpoint: outputs/BiochemT5/production/biochem_bench_split_20260728_v2/forward_backward_span_reaction_center_t5_base_100k/latest
+output_dir: outputs/BiochemT5/benchmark/biochem_bench_forward_main
 
 data:
   train_csv: benchmark/biochem_bench/train.csv
@@ -7,6 +7,11 @@ data:
   test_csv: benchmark/biochem_bench/test.csv
   source_max_length: 512
   target_max_length: 512
+
+vocabulary:
+  task_token: <forward_main>
+  initialize_task_from: <forward>
+  extend_from_splits: [train, val, test]
 
 training:
   seed: 13

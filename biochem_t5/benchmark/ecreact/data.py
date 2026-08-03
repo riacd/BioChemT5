@@ -1,19 +1,18 @@
 from __future__ import annotations
 
 import csv
-import hashlib
 import json
 import random
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Iterable, Iterator, Sequence
+from typing import Any, Iterator, Sequence
 
 import torch
 from torch.utils.data import Dataset, Sampler
 
-from biochem_t5.benchmark.data import canonicalize_smiles_set
+from biochem_t5.benchmark.common import canonicalize_smiles_set, sha256_file
 from biochem_t5.data.smiles_tokenizer import SmilesTokenizer
 
 
@@ -137,14 +136,6 @@ def grouped_stratified_split(
     return train, sorted(validation)
 
 
-def sha256_file(path: str | Path) -> str:
-    digest = hashlib.sha256()
-    with Path(path).open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
 def overlap_audit(train: Sequence[ECReaction], test: Sequence[ECReaction]) -> dict[str, Any]:
     train_exact = {record.exact_key for record in train}
     train_canonical = {record.canonical_key for record in train if record.canonical_key}
@@ -201,14 +192,6 @@ def pretraining_overlap_audit(path: str | Path, test: Sequence[ECReaction]) -> d
         "seen_test_rows": len(exact_ids | canonical_ids),
         "seen_test_sample_ids": sorted(exact_ids | canonical_ids, key=lambda value: int(value) if value.isdigit() else value),
     }
-
-
-def write_json(path: str | Path, payload: Any) -> None:
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    temporary.replace(path)
 
 
 def encode_ec_reaction(tokenizer: SmilesTokenizer, reaction: str, max_length: int = 1200) -> list[int]:
@@ -326,7 +309,3 @@ class HierarchicalBatchSampler(Sampler[list[int]]):
                             self.fallback_counts["reaction"] += 1
                             batch.extend([indices[0], indices[0]])
             yield batch
-
-
-def labels_for(records: Iterable[ECReaction], level: str) -> list[str]:
-    return [record.label(level) for record in records]

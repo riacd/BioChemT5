@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import contextlib
 import hashlib
 import json
+import math
 import os
 import random
 import time
@@ -18,11 +20,14 @@ from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, DistributedSampler
 
 from .data.collator import PretrainCollator
+from .data.diffusion_collator import DiffusionPretrainCollator
 from .data.dataset import IndexedJsonlReactionDataset, JsonlReactionDataset, ReactionDatasetSubset, iter_texts_for_vocab
 from .data.ec_sampler import DistributedBatchSampler, ECBalancedBatchSampler, ECHierarchicalBatchSampler
 from .data.smiles_tokenizer import SmilesTokenizer
 from .losses.hierarchical_ec_contrastive import hierarchical_ec_contrastive_loss
-from .models.biochem_t5 import BiochemT5ForPretraining, build_t5_config
+from .models.biochem_t5 import BiochemT5ForPretraining
+from .models.factory import build_pretraining_model, configured_model_family, save_pretrained_component
+from .models.llada import LladaForMaskedLM
 
 SEQ2SEQ_TASKS = ("forward", "retro", "mlm")
 
@@ -42,11 +47,11 @@ def _requires_ec_training(cfg: dict[str, Any]) -> bool:
 
 
 def _assert_implemented_experiment(cfg: dict[str, Any]) -> None:
+    if str(cfg.get("experiment", {}).get("type", "")).lower() == "ec_interface_placeholder":
+        raise NotImplementedError("EC interface placeholder is not a trainable experiment")
     ec_cfg = cfg.get("ec", {})
     if bool(ec_cfg.get("text_prediction", {}).get("enabled", False)):
         raise NotImplementedError("EC text prediction T5 is not implemented")
-    if str(cfg.get("experiment", {}).get("type", "")).lower() == "ec_interface_placeholder":
-        raise NotImplementedError("EC interface placeholder is not a trainable experiment")
 
 
 def _build_or_load_tokenizer(cfg: dict[str, Any]) -> SmilesTokenizer:
@@ -61,26 +66,22 @@ def _build_or_load_tokenizer(cfg: dict[str, Any]) -> SmilesTokenizer:
 
 
 def _save_checkpoint(
-    model: BiochemT5ForPretraining,
+    model: torch.nn.Module,
     tokenizer: SmilesTokenizer,
     out_dir: Path,
     metrics: dict[str, Any],
     optimizer: torch.optim.Optimizer | None = None,
     step: int = 0,
+    scheduler: torch.optim.lr_scheduler.LRScheduler | None = None,
+    resolved_config: dict[str, Any] | None = None,
 ) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
-    t5_dir = out_dir / "t5"
-    t5_dir.mkdir(parents=True, exist_ok=True)
-    model.t5.config.save_pretrained(t5_dir)
-    if getattr(model.t5, "generation_config", None) is not None:
-        model.t5.generation_config.save_pretrained(t5_dir)
-    weights_path = t5_dir / "pytorch_model.bin"
-    weights_tmp = weights_path.with_suffix(weights_path.suffix + ".tmp")
-    torch.save(model.t5.state_dict(), weights_tmp)
-    weights_tmp.replace(weights_path)
+    save_pretrained_component(model, out_dir)
     state = {"model": model.state_dict(), "step": step, "metrics": metrics}
     if optimizer is not None:
         state["optimizer"] = optimizer.state_dict()
+    if scheduler is not None:
+        state["scheduler"] = scheduler.state_dict()
     state_path = out_dir / "biochem_t5_pretraining_state.pt"
     state_tmp = state_path.with_suffix(state_path.suffix + ".tmp")
     torch.save(state, state_tmp)
@@ -90,6 +91,9 @@ def _save_checkpoint(
     metrics_tmp = metrics_path.with_suffix(metrics_path.suffix + ".tmp")
     metrics_tmp.write_text(json.dumps(metrics, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     metrics_tmp.replace(metrics_path)
+    if resolved_config is not None:
+        config_path = out_dir / "resolved_config.yaml"
+        config_path.write_text(yaml.safe_dump(resolved_config, sort_keys=False), encoding="utf-8")
 
 
 def _resolve_resume_checkpoint(train_cfg: dict[str, Any], out_dir: Path) -> Path | None:
@@ -114,14 +118,33 @@ def _resolve_resume_checkpoint(train_cfg: dict[str, Any], out_dir: Path) -> Path
 
 def _load_checkpoint(
     path: Path,
-    model: BiochemT5ForPretraining,
+    model: torch.nn.Module,
     optimizer: torch.optim.Optimizer,
+    scheduler: torch.optim.lr_scheduler.LRScheduler | None = None,
 ) -> tuple[int, dict[str, Any]]:
     state = torch.load(path, map_location="cpu", weights_only=True)
     model.load_state_dict(state["model"])
     if "optimizer" in state:
         optimizer.load_state_dict(state["optimizer"])
+    if scheduler is not None and "scheduler" in state:
+        scheduler.load_state_dict(state["scheduler"])
     return int(state.get("step", 0)), dict(state.get("metrics") or {})
+
+
+def _build_lr_scheduler(
+    optimizer: torch.optim.Optimizer,
+    max_steps: int,
+    warmup_steps: int,
+    min_lr_ratio: float,
+) -> torch.optim.lr_scheduler.LambdaLR:
+    def scale(step: int) -> float:
+        if warmup_steps > 0 and step < warmup_steps:
+            return max(step, 1) / warmup_steps
+        progress = (step - warmup_steps) / max(max_steps - warmup_steps, 1)
+        cosine = 0.5 * (1.0 + math.cos(math.pi * min(max(progress, 0.0), 1.0)))
+        return min_lr_ratio + (1.0 - min_lr_ratio) * cosine
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, scale)
 
 
 def _distributed_state() -> tuple[bool, int, int, int]:
@@ -183,6 +206,86 @@ def _distributed_max(value: float, device: torch.device) -> float:
     tensor = torch.tensor(value, dtype=torch.float64, device=device)
     dist.all_reduce(tensor, op=dist.ReduceOp.MAX)
     return float(tensor.item())
+
+
+def _distributed_weighted_mean(value: float, weight: float, device: torch.device) -> float | None:
+    packed = torch.tensor([value * weight, weight], dtype=torch.float64, device=device)
+    if dist.is_initialized():
+        dist.all_reduce(packed, op=dist.ReduceOp.SUM)
+    if packed[1].item() <= 0:
+        return None
+    return float((packed[0] / packed[1]).item())
+
+
+def _distributed_monitoring_sum(stats: dict[str, float], device: torch.device) -> dict[str, float]:
+    if not stats:
+        return {}
+    keys = sorted(stats)
+    values = torch.tensor([stats[key] for key in keys], dtype=torch.float64, device=device)
+    if dist.is_initialized():
+        dist.all_reduce(values, op=dist.ReduceOp.SUM)
+    return {key: float(value) for key, value in zip(keys, values.tolist())}
+
+
+def _format_diffusion_monitoring(
+    totals: dict[str, float],
+    length_buckets: list[int] | tuple[int, ...],
+) -> dict[str, Any]:
+    def count(key: str) -> int:
+        return int(round(totals.get(key, 0.0)))
+
+    def ratio(numerator: str, denominator: str) -> float | None:
+        value = totals.get(denominator, 0.0)
+        return totals.get(numerator, 0.0) / value if value > 0 else None
+
+    task_samples = {task: count(f"task_{task}_samples") for task in SEQ2SEQ_TASKS}
+    conditional_samples = task_samples["forward"] + task_samples["retro"]
+    total_samples = sum(task_samples.values())
+    masking: dict[str, Any] = {
+        "noiseable_tokens": count("noiseable_tokens"),
+        "masked_tokens": count("masked_tokens"),
+        "realized_mask_rate": ratio("masked_tokens", "noiseable_tokens"),
+        "mean_mask_probability": ratio("mask_probability_sum", "noiseable_tokens"),
+    }
+    for weight_class in ("base", "neighbor", "center"):
+        prefix = f"weight_{weight_class}"
+        masking[weight_class] = {
+            "tokens": count(f"{prefix}_tokens"),
+            "masked_tokens": count(f"{prefix}_masked_tokens"),
+            "realized_mask_rate": ratio(f"{prefix}_masked_tokens", f"{prefix}_tokens"),
+            "mean_mask_probability": ratio(f"{prefix}_probability_sum", f"{prefix}_tokens"),
+        }
+    return {
+        "task_samples": task_samples,
+        "length_bucket_samples": {str(bucket): count(f"bucket_{bucket}_samples") for bucket in length_buckets},
+        "truncation": {
+            "target_samples": count("target_truncated_samples"),
+            "target_rate": (
+                totals.get("target_truncated_samples", 0.0) / conditional_samples
+                if conditional_samples > 0
+                else None
+            ),
+            "prompt_samples": count("prompt_truncated_samples"),
+            "prompt_rate": (
+                totals.get("prompt_truncated_samples", 0.0) / conditional_samples
+                if conditional_samples > 0
+                else None
+            ),
+            "mlm_samples": count("mlm_truncated_samples"),
+            "mlm_rate": (
+                totals.get("mlm_truncated_samples", 0.0) / task_samples["mlm"]
+                if task_samples["mlm"] > 0
+                else None
+            ),
+        },
+        "reaction_center": {
+            "weighted_samples": count("center_weighted_samples"),
+            "weighted_sample_rate": (
+                totals.get("center_weighted_samples", 0.0) / total_samples if total_samples > 0 else None
+            ),
+        },
+        "masking": masking,
+    }
 
 
 def _seq2seq_task_loss_metrics(logits: torch.Tensor, labels: torch.Tensor, tasks: list[str]) -> dict[str, Any]:
@@ -507,7 +610,8 @@ def _run_validation(
     model.eval()
     max_batches = cfg.get("validation", {}).get("max_batches")
 
-    sums = torch.zeros(4, dtype=torch.float64, device=device)
+    sums = torch.zeros(8, dtype=torch.float64, device=device)
+    monitoring_local: dict[str, float] = {}
     for batch_idx, batch in enumerate(loader):
         if max_batches is not None and batch_idx >= int(max_batches):
             break
@@ -515,10 +619,38 @@ def _run_validation(
         attention_mask = batch["attention_mask"].to(device)
         labels = batch["labels"].to(device)
         with _autocast_context(device, mixed_precision):
-            seq_out = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+            kwargs: dict[str, Any] = {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels}
+            if "loss_mask" in batch:
+                kwargs.update(
+                    loss_mask=batch["loss_mask"].to(device),
+                    noise_probabilities=batch["noise_probabilities"].to(device),
+                    prompt_input_ids=batch["prompt_input_ids"].to(device),
+                    prompt_attention_mask=batch["prompt_attention_mask"].to(device),
+                    length_bucket_labels=batch["length_bucket_labels"].to(device),
+                )
+            seq_out = model(**kwargs)
         tokens = labels.ne(-100).sum().item()
+        for key, value in dict(batch.get("monitoring") or {}).items():
+            monitoring_local[key] = monitoring_local.get(key, 0.0) + float(value)
+        diffusion_loss = getattr(seq_out, "diffusion_loss", None)
+        length_loss = getattr(seq_out, "length_loss", None)
+        batch_samples = input_ids.size(0)
+        conditional_samples = int(batch.get("length_bucket_labels", torch.empty(0)).ne(-100).sum().item())
         sums += torch.tensor(
-            [float(seq_out.loss.detach().cpu()), 1.0, float(input_ids.size(0)), float(tokens)],
+            [
+                float(seq_out.loss.detach().cpu()),
+                1.0,
+                (
+                    float(diffusion_loss.detach().cpu()) * batch_samples
+                    if diffusion_loss is not None
+                    else float(seq_out.loss.detach().cpu()) * batch_samples
+                ),
+                float(batch_samples),
+                (float(length_loss.detach().cpu()) * conditional_samples if length_loss is not None else 0.0),
+                float(conditional_samples),
+                float(batch_samples),
+                float(tokens),
+            ],
             dtype=torch.float64,
             device=device,
         )
@@ -528,13 +660,35 @@ def _run_validation(
     model.train()
 
     batch_count = max(float(sums[1].item()), 1.0)
-    return {
+    result: dict[str, Any] = {
         "val_loss": float((sums[0] / batch_count).item()),
         "val_seq2seq_loss": float((sums[0] / batch_count).item()),
         "val_batches": int(sums[1].item()),
-        "val_samples": int(sums[2].item()),
-        "val_target_tokens": int(sums[3].item()),
+        "val_samples": int(sums[6].item()),
+        "val_target_tokens": int(sums[7].item()),
     }
+    if configured_model_family(cfg) == "llada":
+        result.update(
+            {
+                "val_diffusion_loss": float((sums[2] / max(float(sums[3].item()), 1.0)).item()),
+                "val_length_loss": (
+                    float((sums[4] / sums[5]).item()) if sums[5].item() > 0 else None
+                ),
+                "val_weighted_length_loss": (
+                    float((sums[4] / sums[5]).item())
+                    * float(cfg.get("model", {}).get("length_loss_weight", 0.1))
+                    if sums[5].item() > 0
+                    else None
+                ),
+            }
+        )
+        monitoring_totals = _distributed_monitoring_sum(monitoring_local, device)
+        result["val_monitoring_totals"] = monitoring_totals
+        result["val_monitoring"] = _format_diffusion_monitoring(
+            monitoring_totals,
+            list(cfg.get("model", {}).get("length_buckets", (64, 128, 256, 512, 768))),
+        )
+    return result
 
 
 def train(config_path: str | Path) -> dict[str, Any]:
@@ -548,6 +702,10 @@ def train(config_path: str | Path) -> dict[str, Any]:
 
         wandb_run = _init_wandb(cfg, rank)
         tokenizer = _build_or_load_tokenizer(cfg)
+        family = configured_model_family(cfg)
+        include_ec = _requires_ec_training(cfg)
+        if family == "llada":
+            tokenizer.ensure_mask_token()
         dataset = _build_dataset(cfg, rank=rank)
         validation_cfg = cfg.get("validation", {})
         val_loader = None
@@ -561,44 +719,64 @@ def train(config_path: str | Path) -> dict[str, Any]:
             if _is_main_process(rank):
                 print(json.dumps(split_stats, sort_keys=True), flush=True)
 
-        collator = PretrainCollator(
-            tokenizer=tokenizer,
-            task_probs=cfg["data"]["task_probs"],
-            max_source_length=int(cfg["data"].get("max_source_length", 512)),
-            max_target_length=int(cfg["data"].get("max_target_length", 256)),
-            mask_fraction=float(cfg["masking"].get("mask_fraction", 0.15)),
-            mean_span_len=float(cfg["masking"].get("mean_span_len", 3.0)),
-            center_weight=float(cfg["masking"].get("center_weight", 4.0)),
-            neighbor_weight=float(cfg["masking"].get("neighbor_weight", 2.0)),
-            base_weight=float(cfg["masking"].get("base_weight", 1.0)),
-            seed=seed + rank,
-            mlm_use_mapped_rxn=bool(cfg["masking"].get("mlm_use_mapped_rxn", True)),
-            ec_views_per_record=int(cfg["data"].get("ec_views_per_record", 1)),
-            seq2seq_enabled=bool(cfg["train"].get("seq2seq_enabled", True)),
-        )
+        if family == "llada":
+            collator = DiffusionPretrainCollator(
+                tokenizer=tokenizer,
+                task_probs=cfg["data"]["task_probs"],
+                max_sequence_length=int(cfg["data"].get("max_sequence_length", 2048)),
+                length_buckets=tuple(cfg.get("model", {}).get("length_buckets", (64, 128, 256, 512, 768))),
+                center_weight=float(cfg["masking"].get("center_weight", 4.0)),
+                neighbor_weight=float(cfg["masking"].get("neighbor_weight", 2.0)),
+                base_weight=float(cfg["masking"].get("base_weight", 1.0)),
+                weighted_masking=bool(cfg["masking"].get("weighted", True)),
+                seed=seed + rank,
+                mlm_use_mapped_rxn=bool(cfg["masking"].get("mlm_use_mapped_rxn", True)),
+                timestep_min=float(cfg["masking"].get("timestep_min", 1e-3)),
+                ec_views_per_record=int(cfg["data"].get("ec_views_per_record", 1)),
+                include_ec=include_ec,
+            )
+        else:
+            collator = PretrainCollator(
+                tokenizer=tokenizer,
+                task_probs=cfg["data"]["task_probs"],
+                max_source_length=int(cfg["data"].get("max_source_length", 512)),
+                max_target_length=int(cfg["data"].get("max_target_length", 256)),
+                mask_fraction=float(cfg["masking"].get("mask_fraction", 0.15)),
+                mean_span_len=float(cfg["masking"].get("mean_span_len", 3.0)),
+                center_weight=float(cfg["masking"].get("center_weight", 4.0)),
+                neighbor_weight=float(cfg["masking"].get("neighbor_weight", 2.0)),
+                base_weight=float(cfg["masking"].get("base_weight", 1.0)),
+                seed=seed + rank,
+                mlm_use_mapped_rxn=bool(cfg["masking"].get("mlm_use_mapped_rxn", True)),
+                ec_views_per_record=int(cfg["data"].get("ec_views_per_record", 1)),
+                seq2seq_enabled=bool(cfg["train"].get("seq2seq_enabled", True)),
+                include_ec=include_ec,
+            )
         loader = _build_loader(cfg, dataset, collator, seed=seed, rank=rank, world_size=world_size)
         if bool(validation_cfg.get("enabled", False)):
-            val_loader = _build_validation_loader(cfg, val_dataset, collator, seed=seed, rank=rank, world_size=world_size)
+            val_collator = copy.deepcopy(collator)
+            val_collator.rng.seed(int(validation_cfg.get("seed", seed + 10_000)))
+            val_loader = _build_validation_loader(
+                cfg, val_dataset, val_collator, seed=seed, rank=rank, world_size=world_size
+            )
 
         device = torch.device(
             f"cuda:{local_rank}" if torch.cuda.is_available() and cfg["train"].get("use_cuda", True) else "cpu"
         )
         model_cfg = cfg.get("model", {})
-        raw_model = BiochemT5ForPretraining(
-            build_t5_config(len(tokenizer), model_cfg),
-            projection_dim=int(model_cfg.get("projection_dim", 128)),
-        ).to(device)
+        raw_model = build_pretraining_model(tokenizer, cfg).to(device)
         seq2seq_enabled = bool(cfg["train"].get("seq2seq_enabled", True))
-        if not seq2seq_enabled:
+        if not seq2seq_enabled and isinstance(raw_model, BiochemT5ForPretraining):
             for parameter in raw_model.t5.decoder.parameters():
                 parameter.requires_grad = False
             raw_model.t5.shared.weight.requires_grad = True
         if bool(cfg["train"].get("gradient_checkpointing", False)):
+            checkpoint_model = raw_model.t5 if isinstance(raw_model, BiochemT5ForPretraining) else raw_model
             try:
-                raw_model.t5.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+                checkpoint_model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
             except TypeError:
-                raw_model.t5.gradient_checkpointing_enable()
-            raw_model.t5.config.use_cache = False
+                checkpoint_model.gradient_checkpointing_enable()
+            checkpoint_model.config.use_cache = False
 
         if is_distributed and device.type == "cuda":
             model = DistributedDataParallel(
@@ -617,7 +795,13 @@ def train(config_path: str | Path) -> dict[str, Any]:
         else:
             model = raw_model
 
-        optimizer = torch.optim.AdamW(raw_model.parameters(), lr=float(cfg["train"].get("learning_rate", 3e-4)))
+        learning_rate = float(cfg["train"].get("learning_rate", 3e-4))
+        optimizer = torch.optim.AdamW(
+            raw_model.parameters(),
+            lr=learning_rate,
+            betas=tuple(cfg["train"].get("betas", (0.9, 0.999))),
+            weight_decay=float(cfg["train"].get("weight_decay", 0.0)),
+        )
         ec_cfg = cfg.get("ec", {})
         ec_contrastive_cfg = ec_cfg.get("contrastive", {})
         ec_loss_weight = float(cfg.get("loss", {}).get("ec_contrastive", 0.0) or 0.0)
@@ -629,6 +813,12 @@ def train(config_path: str | Path) -> dict[str, Any]:
         ec_temperature = float(cfg.get("loss", {}).get("temperature", 0.07))
         ec_level_weights = ec_contrastive_cfg.get("level_weights")
         max_steps = int(cfg["train"].get("max_steps", 100))
+        scheduler = _build_lr_scheduler(
+            optimizer,
+            max_steps=max_steps,
+            warmup_steps=int(cfg["train"].get("warmup_steps", 0)),
+            min_lr_ratio=float(cfg["train"].get("min_learning_rate", 0.0)) / learning_rate,
+        )
         save_every = int(cfg["train"].get("save_every", 0))
         gradient_accumulation_steps = int(cfg["train"].get("gradient_accumulation_steps", 1))
         mixed_precision = str(cfg["train"].get("mixed_precision", "no")).lower()
@@ -648,7 +838,7 @@ def train(config_path: str | Path) -> dict[str, Any]:
         resume_path = _resolve_resume_checkpoint(cfg["train"], out_dir)
         step = 0
         if resume_path is not None:
-            step, resumed_metrics = _load_checkpoint(resume_path, raw_model, optimizer)
+            step, resumed_metrics = _load_checkpoint(resume_path, raw_model, optimizer, scheduler)
             metrics.update(resumed_metrics)
             metrics["steps"] = step
             if _is_main_process(rank):
@@ -662,14 +852,28 @@ def train(config_path: str | Path) -> dict[str, Any]:
         last_log_samples = total_samples
         last_log_tokens = total_tokens
         optimizer.zero_grad(set_to_none=True)
+        best_val_loss = float(metrics.get("best_val_loss", float("inf")))
+        bad_validations = int(metrics.get("bad_validations", 0))
+        early_stopping_patience = int(validation_cfg.get("early_stopping_patience", 0))
+        stop_training = False
+        monitoring_totals = {
+            str(key): float(value) for key, value in dict(metrics.get("monitoring_totals") or {}).items()
+        }
+        pending_monitoring: dict[str, float] = {}
+        pending_diffusion_sum = 0.0
+        pending_diffusion_samples = 0
+        pending_length_sum = 0.0
+        pending_length_samples = 0
 
-        while step < max_steps:
+        while step < max_steps and not stop_training:
             if hasattr(loader.sampler, "set_epoch"):
                 loader.sampler.set_epoch(step)
             for batch in loader:
                 labels = batch["labels"].to(device) if seq2seq_enabled else None
-                batch_samples = len(batch["ec_level_sets"])
+                batch_samples = len(batch["tasks"]) if batch.get("tasks") else len(batch.get("ec_level_sets", []))
                 batch_tokens = int(labels.ne(-100).sum().item()) if labels is not None else 0
+                for key, value in dict(batch.get("monitoring") or {}).items():
+                    pending_monitoring[key] = pending_monitoring.get(key, 0.0) + float(value)
                 sync_gradients = (micro_step + 1) % gradient_accumulation_steps == 0
                 sync_context = model.no_sync() if is_distributed and not sync_gradients else contextlib.nullcontext()
                 with sync_context:
@@ -677,6 +881,15 @@ def train(config_path: str | Path) -> dict[str, Any]:
                         if ec_contrastive_enabled and seq2seq_enabled:
                             input_ids = batch["input_ids"].to(device)
                             attention_mask = batch["attention_mask"].to(device)
+                            model_kwargs: dict[str, Any] = {}
+                            if family == "llada":
+                                model_kwargs.update(
+                                    loss_mask=batch["loss_mask"].to(device),
+                                    noise_probabilities=batch["noise_probabilities"].to(device),
+                                    prompt_input_ids=batch["prompt_input_ids"].to(device),
+                                    prompt_attention_mask=batch["prompt_attention_mask"].to(device),
+                                    length_bucket_labels=batch["length_bucket_labels"].to(device),
+                                )
                             seq_out, ec_representations = model(
                                 input_ids=input_ids,
                                 attention_mask=attention_mask,
@@ -684,6 +897,7 @@ def train(config_path: str | Path) -> dict[str, Any]:
                                 ec_input_ids=batch["ec_input_ids"].to(device),
                                 ec_attention_mask=batch["ec_attention_mask"].to(device),
                                 return_ec_representations=True,
+                                **model_kwargs,
                             )
                             ec_loss = _complete_ec_contrastive_loss(
                                 ec_representations,
@@ -711,11 +925,36 @@ def train(config_path: str | Path) -> dict[str, Any]:
                         else:
                             input_ids = batch["input_ids"].to(device)
                             attention_mask = batch["attention_mask"].to(device)
-                            seq_out = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+                            model_kwargs = {}
+                            if family == "llada":
+                                model_kwargs.update(
+                                    loss_mask=batch["loss_mask"].to(device),
+                                    noise_probabilities=batch["noise_probabilities"].to(device),
+                                    prompt_input_ids=batch["prompt_input_ids"].to(device),
+                                    prompt_attention_mask=batch["prompt_attention_mask"].to(device),
+                                    length_bucket_labels=batch["length_bucket_labels"].to(device),
+                                )
+                            seq_out = model(
+                                input_ids=input_ids,
+                                attention_mask=attention_mask,
+                                labels=labels,
+                                **model_kwargs,
+                            )
                             ec_loss = None
                             loss = seq_out.loss
                         loss_for_backward = loss / gradient_accumulation_steps
                     loss_for_backward.backward()
+
+                if family == "llada" and seq_out is not None:
+                    local_diffusion = getattr(seq_out, "diffusion_loss", None)
+                    if local_diffusion is not None and labels is not None:
+                        pending_diffusion_sum += float(local_diffusion.detach().cpu()) * labels.size(0)
+                        pending_diffusion_samples += labels.size(0)
+                    local_length = getattr(seq_out, "length_loss", None)
+                    conditional_samples = int(batch["length_bucket_labels"].ne(-100).sum().item())
+                    if local_length is not None and conditional_samples > 0:
+                        pending_length_sum += float(local_length.detach().cpu()) * conditional_samples
+                        pending_length_samples += conditional_samples
 
                 micro_step += 1
                 total_samples += batch_samples
@@ -729,7 +968,12 @@ def train(config_path: str | Path) -> dict[str, Any]:
                     float(cfg["train"].get("max_grad_norm", 1.0)),
                 )
                 optimizer.step()
+                scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
+                reduced_monitoring = _distributed_monitoring_sum(pending_monitoring, device)
+                for key, value in reduced_monitoring.items():
+                    monitoring_totals[key] = monitoring_totals.get(key, 0.0) + value
+                pending_monitoring = {}
 
                 now = time.time()
                 elapsed = max(now - last_log_time, 1e-9)
@@ -743,6 +987,23 @@ def train(config_path: str | Path) -> dict[str, Any]:
                 seq2seq_loss_value = (
                     _distributed_mean(float(seq_out.loss.detach().cpu()), device) if seq_out is not None else None
                 )
+                diffusion_loss_value = None
+                length_loss_value = None
+                if family == "llada":
+                    diffusion_loss_value = _distributed_weighted_mean(
+                        pending_diffusion_sum / max(pending_diffusion_samples, 1),
+                        float(pending_diffusion_samples),
+                        device,
+                    )
+                    length_loss_value = _distributed_weighted_mean(
+                        pending_length_sum / max(pending_length_samples, 1),
+                        float(pending_length_samples),
+                        device,
+                    )
+                    pending_diffusion_sum = 0.0
+                    pending_diffusion_samples = 0
+                    pending_length_sum = 0.0
+                    pending_length_samples = 0
                 ec_loss_value = (
                     _distributed_mean(float(ec_loss.detach().cpu()), device) if ec_loss is not None else None
                 )
@@ -751,6 +1012,13 @@ def train(config_path: str | Path) -> dict[str, Any]:
                     "steps": step,
                     "loss": loss_value,
                     "seq2seq_loss": seq2seq_loss_value,
+                    "diffusion_loss": diffusion_loss_value,
+                    "length_loss": length_loss_value,
+                    "weighted_length_loss": (
+                        length_loss_value * float(model_cfg.get("length_loss_weight", 0.1))
+                        if length_loss_value is not None
+                        else None
+                    ),
                     "ec_loss": ec_loss_value,
                     "learning_rate": optimizer.param_groups[0]["lr"],
                     "grad_norm": grad_norm_value,
@@ -761,6 +1029,12 @@ def train(config_path: str | Path) -> dict[str, Any]:
                     "rank": rank,
                     "world_size": world_size,
                 }
+                if monitoring_totals:
+                    metrics["monitoring_totals"] = dict(monitoring_totals)
+                    metrics["monitoring"] = _format_diffusion_monitoring(
+                        monitoring_totals,
+                        list(model_cfg.get("length_buckets", (64, 128, 256, 512, 768))),
+                    )
                 if seq_out is not None and labels is not None:
                     metrics.update(_seq2seq_task_loss_metrics(seq_out.logits, labels, batch["tasks"]))
                 if device.type == "cuda":
@@ -770,7 +1044,23 @@ def train(config_path: str | Path) -> dict[str, Any]:
                     metrics["cuda_max_memory_reserved_gb"] = round(max_reserved, 3)
                 should_validate = val_loader is not None and val_every > 0 and step % val_every == 0
                 if should_validate:
+                    if hasattr(val_loader.collate_fn, "rng"):
+                        val_loader.collate_fn.rng.seed(int(validation_cfg.get("seed", seed + 10_000)))
                     metrics.update(_run_validation(model, val_loader, cfg, device, mixed_precision))
+                    improved = float(metrics["val_loss"]) < best_val_loss
+                    if improved:
+                        best_val_loss = float(metrics["val_loss"])
+                        bad_validations = 0
+                    else:
+                        bad_validations += 1
+                    metrics["best_val_loss"] = best_val_loss
+                    metrics["bad_validations"] = bad_validations
+                    if improved and _is_main_process(rank):
+                        _save_checkpoint(
+                            raw_model, tokenizer, out_dir / "best", metrics,
+                            optimizer=optimizer, scheduler=scheduler, step=step, resolved_config=cfg,
+                        )
+                    stop_training = early_stopping_patience > 0 and bad_validations >= early_stopping_patience
                 if _is_main_process(rank) and (
                     step % int(cfg["train"].get("log_every", 10)) == 0 or step == 1 or should_validate
                 ):
@@ -778,12 +1068,23 @@ def train(config_path: str | Path) -> dict[str, Any]:
                     if wandb_run is not None:
                         wandb_run.log(metrics, step=step)
                 if save_every > 0 and step % save_every == 0 and _is_main_process(rank):
-                    _save_checkpoint(raw_model, tokenizer, out_dir / "latest", metrics, optimizer=optimizer, step=step)
+                    _save_checkpoint(
+                        raw_model, tokenizer, out_dir / "latest", metrics,
+                        optimizer=optimizer, scheduler=scheduler, step=step, resolved_config=cfg,
+                    )
+                if step == int(cfg["train"].get("fixed_checkpoint_step", -1)) and _is_main_process(rank):
+                    _save_checkpoint(
+                        raw_model, tokenizer, out_dir / f"checkpoint_{step}", metrics,
+                        optimizer=optimizer, scheduler=scheduler, step=step, resolved_config=cfg,
+                    )
                 if step >= max_steps:
                     break
 
         if _is_main_process(rank):
-            _save_checkpoint(raw_model, tokenizer, out_dir, metrics, optimizer=optimizer, step=step)
+            _save_checkpoint(
+                raw_model, tokenizer, out_dir, metrics,
+                optimizer=optimizer, scheduler=scheduler, step=step, resolved_config=cfg,
+            )
             if wandb_run is not None:
                 wandb_run.finish()
         _maybe_barrier()

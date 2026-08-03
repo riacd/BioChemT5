@@ -1,0 +1,26 @@
+pretrained_checkpoint: outputs/BiochemT5/production/biochem_bench_split_20260728_v2/span_reaction_center_t5_base_100k
+output_dir: outputs/BiochemT5/benchmark/biochem_bench_split_20260728_v2_span_reaction_center_retrosynthesis
+
+data:
+  train_csv: benchmark/biochem_bench/train.csv
+  val_csv: benchmark/biochem_bench/val.csv
+  test_csv: benchmark/biochem_bench/test.csv
+  source_max_length: 512
+  target_max_length: 512
+
+training:
+  seed: 13
+  per_device_batch_size: 16
+  validation_batch_size: 16
+  gradient_accumulation_steps: 1
+  learning_rate: 1.0e-4
+  weight_decay: 0.0
+  warmup_steps: 0
+  max_steps: 20000
+  validate_every_steps: 500
+  early_stopping_patience: 5
+  max_grad_norm: 1.0
+  bf16: true
+  gradient_checkpointing: true
+  num_workers: 0
+  auto_resume: true

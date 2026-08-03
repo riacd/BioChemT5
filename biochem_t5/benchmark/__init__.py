@@ -1,2 +1,1 @@
-"""Retrosynthesis fine-tuning and evaluation utilities."""
-
+"""Benchmark-specific training and evaluation packages."""

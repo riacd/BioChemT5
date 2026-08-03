@@ -6,6 +6,8 @@ from transformers import T5Config, T5ForConditionalGeneration
 
 
 class BiochemT5ForPretraining(nn.Module):
+    family = "t5"
+
     def __init__(self, config: T5Config, projection_dim: int = 128):
         super().__init__()
         self.t5 = T5ForConditionalGeneration(config)
@@ -17,6 +19,22 @@ class BiochemT5ForPretraining(nn.Module):
 
     def forward_seq2seq(self, input_ids: torch.Tensor, attention_mask: torch.Tensor, labels: torch.Tensor):
         return self.t5(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+
+    def forward_logits(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+        decoder_input_ids = torch.full(
+            (input_ids.size(0), 1),
+            self.t5.config.decoder_start_token_id,
+            dtype=torch.long,
+            device=input_ids.device,
+        )
+        return self.t5(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            decoder_input_ids=decoder_input_ids,
+        ).logits
+
+    def resize_token_embeddings(self, size: int):
+        return self.t5.resize_token_embeddings(size)
 
     def encode_reactions(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
         hidden = self.t5.encoder(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state

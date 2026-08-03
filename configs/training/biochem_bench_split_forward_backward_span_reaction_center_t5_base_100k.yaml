@@ -1,25 +1,28 @@
 seed: 13
 
 experiment:
-  name: ec_hierarchy_only_t5_base_100k
-  type: ec_hierarchy_only_ablation
+  name: biochem_bench_split_20260728_v2_forward_backward_span_reaction_center_t5_base_100k
+  type: seq2seq_ablation
 
 data:
-  center_corpus: data/BiochemT5/pretrain_corpus/cluster_centers.rsmiles_aug20.centered.jsonl
-  index_path: data/BiochemT5/pretrain_corpus/cluster_centers.rsmiles_aug20.centered.index.pkl
+  center_corpus: data/BiochemT5/pretrain_corpus_biochem_bench_clean/pretrain.jsonl
+  index_path: data/BiochemT5/pretrain_corpus_biochem_bench_clean/pretrain.index.pkl
   dataset_type: indexed
   max_records: null
   max_source_length: 1200
   max_target_length: 768
   ec_views_per_record: 1
-  task_probs: {}
+  task_probs:
+    forward: 0.35
+    retro: 0.35
+    mlm: 0.30
 
 masking:
   mask_fraction: 0.15
   mean_span_len: 3.0
   base_weight: 1.0
-  center_weight: 1.0
-  neighbor_weight: 1.0
+  center_weight: 4.0
+  neighbor_weight: 2.0
   mlm_use_mapped_rxn: true
 
 tokenizer:
@@ -43,23 +46,12 @@ model:
   projection_dim: 256
 
 loss:
-  ec_contrastive: 1.0
+  ec_contrastive: 0.0
   temperature: 0.07
 
-ec:
-  contrastive:
-    enabled: true
-    level_weights:
-      ec1: 0.1
-      ec2: 0.2
-      ec3: 0.3
-      ec4: 0.4
-  text_prediction:
-    enabled: false
-
 train:
-  output_dir: outputs/BiochemT5/production/ec_hierarchy_only_t5_base_100k
-  seq2seq_enabled: false
+  output_dir: outputs/BiochemT5/production/biochem_bench_split_20260728_v2/forward_backward_span_reaction_center_t5_base_100k
+  batch_size: 28
   num_workers: 2
   pin_memory: true
   learning_rate: 0.0001
@@ -75,18 +67,22 @@ train:
   ddp_find_unused_parameters: false
   use_cuda: true
   sampler:
-    type: ec_hierarchical
-    groups_per_batch: 12
-    seq2seq_only_samples_per_batch: 0
+    type: random
 
 validation:
-  enabled: false
+  enabled: true
+  val_fraction: 0.01
+  split_seed: 13
+  every_steps: 1000
+  batch_size: 28
+  num_workers: 2
+  max_batches: 100
 
 logging:
   wandb:
     enabled: true
     mode: offline
     project: BioChemT5
-    name: ec_hierarchy_only_t5_base_100k
+    name: biochem_bench_split_20260728_v2_forward_backward_span_reaction_center_t5_base_100k
     dir: .
-    tags: [production, ablation, ec-hierarchy-only, t5-base]
+    tags: [production, biochem-bench-split, biochem-bench-20260728-v2, forward, retro, reaction-center, t5-base]

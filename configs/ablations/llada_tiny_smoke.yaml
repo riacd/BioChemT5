@@ -1,0 +1,70 @@
+seed: 13
+
+experiment:
+  name: llada_tiny_smoke
+  type: diffusion_pretraining
+
+data:
+  center_corpus: data/BiochemT5/pretrain_corpus/cluster_centers.rsmiles_aug20.centered.jsonl
+  dataset_type: memory
+  max_records: 16
+  max_sequence_length: 256
+  ec_views_per_record: 1
+  task_probs:
+    forward: 0.35
+    retro: 0.35
+    mlm: 0.30
+
+masking:
+  weighted: false
+  timestep_min: 0.001
+  base_weight: 1.0
+  neighbor_weight: 1.0
+  center_weight: 1.0
+  mlm_use_mapped_rxn: true
+
+tokenizer:
+  path: data/BiochemT5/tokenizer/smiles_wordlevel_final_vocab.json
+  rebuild: false
+
+model:
+  family: llada
+  hidden_size: 64
+  intermediate_size: 128
+  num_hidden_layers: 2
+  num_attention_heads: 4
+  max_position_embeddings: 256
+  projection_dim: 32
+  length_buckets: [16, 32, 64, 128]
+  length_loss_weight: 0.1
+
+loss:
+  ec_contrastive: 0.0
+
+train:
+  output_dir: outputs/BiochemT5/ablations/llada_tiny_smoke
+  batch_size: 2
+  num_workers: 0
+  learning_rate: 0.0002
+  betas: [0.9, 0.95]
+  weight_decay: 0.1
+  warmup_steps: 1
+  min_learning_rate: 0.00002
+  max_steps: 4
+  auto_resume: true
+  max_grad_norm: 1.0
+  gradient_accumulation_steps: 1
+  mixed_precision: "no"
+  gradient_checkpointing: false
+  use_cuda: false
+  log_every: 1
+  save_every: 2
+  sampler:
+    type: random
+
+validation:
+  enabled: false
+
+logging:
+  wandb:
+    enabled: false
